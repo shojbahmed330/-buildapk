@@ -1,10 +1,14 @@
 const fs = require("fs");
 const path = require("path");
 
+// 📌 Absolute root (scripts/ এর parent)
+const ROOT = path.resolve(__dirname, "..");
+const TEMPLATE = path.join(ROOT, "template");
+
 // 🔍 Find .build-meta.json
 const metaCandidates = [
-  path.resolve(process.cwd(), ".build-meta.json"),
-  path.resolve(process.cwd(), "template", ".build-meta.json"),
+  path.join(ROOT, ".build-meta.json"),
+  path.join(TEMPLATE, ".build-meta.json"),
 ];
 
 const metaPath = metaCandidates.find((p) => fs.existsSync(p));
@@ -20,15 +24,14 @@ if (!meta.package_id || !meta.app_name) {
   throw new Error("Invalid .build-meta.json");
 }
 
-// 🔐 Escape appName safely
+// 🔐 Escape app name
 const safeAppName = String(meta.app_name).replace(/'/g, "\\'");
 
-const ANDROID = path.join("template", "android");
+// 📁 Absolute paths
+const ANDROID = path.join(TEMPLATE, "android");
+const capCfg = path.join(TEMPLATE, "capacitor.config.ts");
 
-// 1️⃣ Ensure + PATCH capacitor.config.ts
-const capCfg = path.join("template", "capacitor.config.ts");
-
-// 👉 Create if not exists
+// 1️⃣ Create বা update capacitor.config.ts
 if (!fs.existsSync(capCfg)) {
   fs.writeFileSync(
     capCfg,
@@ -44,7 +47,6 @@ export default config;
 `
   );
 } else {
-  // 👉 Update if exists
   let cap = fs.readFileSync(capCfg, "utf8");
 
   cap = cap.replace(/appId:\s*'[^']*'/, `appId: '${meta.package_id}'`);
@@ -53,7 +55,7 @@ export default config;
   fs.writeFileSync(capCfg, cap);
 }
 
-// 2️⃣ Patch android/app/build.gradle
+// 2️⃣ Patch build.gradle
 const buildGradle = path.join(ANDROID, "app", "build.gradle");
 
 if (fs.existsSync(buildGradle)) {
