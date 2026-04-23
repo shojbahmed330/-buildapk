@@ -8,8 +8,8 @@ on:
       package_id:      { required: true, type: string }
       version_name:    { required: true, type: string }
       version_code:    { required: true, type: string }
-      callback_url:    { required: true, type: string }   # https://<project>.supabase.co/functions/v1/build-webhook
-      files_url:       { required: true, type: string }   # https://<project>.supabase.co/functions/v1/build-files?build_id=...
+      callback_url:    { required: true, type: string }
+      files_url:       { required: true, type: string }
       webhook_secret:  { required: true, type: string }
 
 jobs:
@@ -28,26 +28,31 @@ jobs:
       RUN_URL:        ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
     steps:
-      - name: Mark queued done
-        run: ./scripts/notify.sh step_done queued "Runner started"
-        shell: bash
-
       - name: Checkout template
         uses: actions/checkout@v4
 
       - name: Make scripts executable
         run: chmod +x scripts/*.sh
 
+      - name: Mark queued done
+        run: ./scripts/notify.sh step_done queued "Runner started"
+        shell: bash
+
       - name: Notify checkout
         run: ./scripts/notify.sh step_done checkout
 
       - name: Setup Node 20
         uses: actions/setup-node@v4
-        with: { node-version: '20', cache: 'npm', cache-dependency-path: template/package-lock.json }
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: template/package-lock.json
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
-        with: { distribution: 'temurin', java-version: '17' }
+        with:
+          distribution: 'temurin'
+          java-version: '17'
 
       - name: Inject project files
         run: |
@@ -75,7 +80,6 @@ jobs:
           ../scripts/notify.sh step_start cap_sync
           npx cap add android || true
           npx cap sync android
-          # Patch package id + app name into native project
           node ../scripts/patch-android.js
           ../scripts/notify.sh step_done cap_sync
 
