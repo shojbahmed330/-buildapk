@@ -16,12 +16,19 @@ if (!metaPath) {
 // 📦 Load meta
 const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
 
+if (!meta.package_id || !meta.app_name) {
+  throw new Error("Invalid .build-meta.json");
+}
+
+// 🔐 Escape appName safely
+const safeAppName = String(meta.app_name).replace(/'/g, "\\'");
+
 const ANDROID = path.join("template", "android");
 
 // 1️⃣ Ensure + PATCH capacitor.config.ts
 const capCfg = path.join("template", "capacitor.config.ts");
 
-// 👉 যদি না থাকে → create
+// 👉 Create if not exists
 if (!fs.existsSync(capCfg)) {
   fs.writeFileSync(
     capCfg,
@@ -29,7 +36,7 @@ if (!fs.existsSync(capCfg)) {
 
 const config: CapacitorConfig = {
   appId: '${meta.package_id}',
-  appName: '${meta.app_name}',
+  appName: '${safeAppName}',
   webDir: 'dist',
 };
 
@@ -37,14 +44,11 @@ export default config;
 `
   );
 } else {
-  // 👉 থাকলে → update (FIXED PART)
+  // 👉 Update if exists
   let cap = fs.readFileSync(capCfg, "utf8");
 
   cap = cap.replace(/appId:\s*'[^']*'/, `appId: '${meta.package_id}'`);
-  cap = cap.replace(
-    /appName:\s*'[^']*'/,
-    `appName: '${String(meta.app_name).replace(/'/g, "\\'")}'`
-  );
+  cap = cap.replace(/appName:\s*'[^']*'/, `appName: '${safeAppName}'`);
 
   fs.writeFileSync(capCfg, cap);
 }
