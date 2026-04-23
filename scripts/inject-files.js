@@ -1,6 +1,7 @@
-// Downloads the project file snapshot from Supabase build-files endpoint
-// and writes them into ./template/, scaffolding a base Vite+React+Capacitor
-// project first so AI-generated files have something to build on.
+// Build-time injector:
+// 1. Copies the production template/ folder to a fresh build dir
+// 2. Overlays AI-generated files from the Supabase build-files endpoint
+// 3. Skips AI-generated copies of protected config files
 
 const fs = require("fs");
 const path = require("path");
@@ -13,6 +14,16 @@ if (!FILES_URL || !SECRET) {
   console.error("FILES_URL and WEBHOOK_SECRET required");
   process.exit(1);
 }
+
+const REPO_TEMPLATE = path.join(process.cwd(), "template");
+const BUILD_DIR = path.join(process.cwd(), "build-template");
+
+const PROTECTED_FILES = new Set([
+  "index.html", "package.json", "package-lock.json",
+  "vite.config.ts", "vite.config.js", "tsconfig.json",
+  "tailwind.config.js", "tailwind.config.ts", "postcss.config.js",
+  "capacitor.config.ts", "src/main.tsx", "src/index.tsx", "src/index.css",
+]);
 
 function fetchJson(url) {
   return new Promise((resolve, reject) => {
@@ -29,161 +40,92 @@ function fetchJson(url) {
   });
 }
 
+function copyDir(src, dest) {
+  fs.mkdirSync(dest, { recursive: true });
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, entry.name);
+    const d = path.join(dest, entry.name);
+    if (entry.isDirectory()) copyDir(s, d);
+    else fs.copyFileSync(s, d);
+  }
+}
+
 function writeFile(root, rel, content) {
   const full = path.join(root, rel);
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, content, "utf8");
 }
 
-function scaffoldBase(root, meta) {
-  const appName = meta.app_name || "My App";
-  const pkgId = meta.package_id || "app.lovable.generated";
-
-  const files = {
-    "package.json": JSON.stringify({
-      name: "lovable-app",
-      private: true,
-      version: meta.version_name || "1.0.0",
-      type: "module",
-      scripts: { dev: "vite", build: "vite build", preview: "vite preview" },
-      dependencies: {
-        react: "^18.3.1",
-        "react-dom": "^18.3.1",
-        "react-router-dom": "^6.26.2",
-        "lucide-react": "^0.462.0",
-      },
-      devDependencies: {
-        "@capacitor/cli": "^6.1.2",
-        "@capacitor/core": "^6.1.2",
-        "@capacitor/android": "^6.1.2",
-        "@vitejs/plugin-react-swc": "^3.5.0",
-        "@types/react": "^18.3.3",
-        "@types/react-dom": "^18.3.0",
-        autoprefixer: "^10.4.20",
-        postcss: "^8.4.47",
-        tailwindcss: "^3.4.11",
-        typescript: "^5.5.3",
-        vite: "^5.4.1",
-      },
-    }, null, 2),
-
-    "vite.config.ts": `import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react-swc";
-import path from "path";
-export default defineConfig({
-  plugins: [react()],
-  resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
-  build: { outDir: "dist" },
-});
-`,
-
-    "tsconfig.json": JSON.stringify({
-      compilerOptions: {
-        target: "ES2020",
-        useDefineForClassFields: true,
-        lib: ["ES2020", "DOM", "DOM.Iterable"],
-        module: "ESNext",
-        skipLibCheck: true,
-        moduleResolution: "bundler",
-        allowImportingTsExtensions: true,
-        resolveJsonModule: true,
-        isolatedModules: true,
-        noEmit: true,
-        jsx: "react-jsx",
-        strict: false,
-        baseUrl: ".",
-        paths: { "@/*": ["./src/*"] },
-      },
-      include: ["src"],
-    }, null, 2),
-
-    "tailwind.config.js": `export default {
-  content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
-  theme: { extend: {} },
-  plugins: [],
-};
-`,
-    "postcss.config.js": `export default { plugins: { tailwindcss: {}, autoprefixer: {} } };\n`,
-
-    "index.html": `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <title>${appName}</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
-`,
-
-    "src/main.tsx": `import React from "react";
-import ReactDOM from "react-dom/client";
-import App from "./App";
-import "./index.css";
-ReactDOM.createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);
-`,
-
-    "src/index.css": `@tailwind base;
-@tailwind components;
-@tailwind utilities;
-html,body,#root{height:100%;margin:0;font-family:system-ui,-apple-system,sans-serif;}
-`,
-
-    "capacitor.config.ts": `import type { CapacitorConfig } from '@capacitor/cli';
-const config: CapacitorConfig = {
-  appId: '${pkgId}',
-  appName: ${JSON.stringify(appName)},
-  webDir: 'dist',
-};
-export default config;
-`,
-  };
-
-  for (const [rel, content] of Object.entries(files)) {
-    writeFile(root, rel, content);
-  }
-  console.log(`✓ Scaffolded ${Object.keys(files).length} base files`);
-}
-
 (async () => {
+  if (!fs.existsSync(path.join(REPO_TEMPLATE, "package.json"))) {
+    console.error("FATAL: ./template/package.json missing in repo. Commit the template/ folder.");
+    process.exit(1);
+  }
+
+  if (fs.existsSync(BUILD_DIR)) fs.rmSync(BUILD_DIR, { recursive: true, force: true });
+  copyDir(REPO_TEMPLATE, BUILD_DIR);
+  console.log("✓ Copied repo template/ -> build-template/");
+
   const payload = await fetchJson(FILES_URL);
   const files = payload.files || [];
-  console.log(`Got ${files.length} project files from snapshot.`);
+  console.log(`Got ${files.length} AI files from snapshot.`);
 
-  const root = path.join(process.cwd(), "template");
-  fs.mkdirSync(root, { recursive: true });
-
-  scaffoldBase(root, payload);
-
-  let written = 0;
+  let written = 0, skipped = 0;
   for (const f of files) {
     const rel = (f.path || "").replace(/^\/+/, "");
     if (!rel) continue;
-    if (rel.includes("..")) { console.warn("skip", rel); continue; }
-    writeFile(root, rel, f.content ?? "");
+    if (rel.includes("..")) { console.warn("skip traversal:", rel); continue; }
+    if (PROTECTED_FILES.has(rel)) {
+      console.log(`⏭  Skipped protected: ${rel}`);
+      skipped++;
+      continue;
+    }
+    writeFile(BUILD_DIR, rel, f.content ?? "");
     written++;
   }
-  console.log(`✓ Overlaid ${written} AI-generated files`);
+  console.log(`✓ Overlaid ${written} AI files (${skipped} protected kept)`);
+
+  const appName = payload.app_name || "My App";
+  const pkgId = payload.package_id || "app.lovable.generated";
+  const versionName = payload.version_name || "1.0.0";
+
+  const capPath = path.join(BUILD_DIR, "capacitor.config.ts");
+  if (fs.existsSync(capPath)) {
+    let cap = fs.readFileSync(capPath, "utf8");
+    cap = cap.replace(/appId:\s*'[^']*'/, `appId: '${pkgId}'`);
+    cap = cap.replace(/appName:\s*'[^']*'/, `appName: '${appName.replace(/'/g, "\\'")}'`);
+    fs.writeFileSync(capPath, cap);
+  }
+
+  const htmlPath = path.join(BUILD_DIR, "index.html");
+  if (fs.existsSync(htmlPath)) {
+    let html = fs.readFileSync(htmlPath, "utf8");
+    html = html.replace(/<title>[^<]*<\/title>/, `<title>${appName}</title>`);
+    fs.writeFileSync(htmlPath, html);
+  }
+
+  const pkgPath = path.join(BUILD_DIR, "package.json");
+  if (fs.existsSync(pkgPath)) {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    pkg.version = versionName;
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+  }
+
+  const TEMP_BACKUP = path.join(process.cwd(), ".template-original");
+  if (fs.existsSync(TEMP_BACKUP)) fs.rmSync(TEMP_BACKUP, { recursive: true, force: true });
+  fs.renameSync(REPO_TEMPLATE, TEMP_BACKUP);
+  fs.renameSync(BUILD_DIR, REPO_TEMPLATE);
+  console.log("✓ Activated build-template at ./template/");
 
   fs.writeFileSync(
     path.join(process.cwd(), ".build-meta.json"),
     JSON.stringify({
-      app_name: payload.app_name,
-      package_id: payload.package_id,
-      version_name: payload.version_name,
-      version_code: payload.version_code,
-    }),
+      app_name: appName, package_id: pkgId,
+      version_name: versionName, version_code: payload.version_code,
+    }, null, 2),
   );
 
-  const pkgPath = path.join(root, "package.json");
-  if (!fs.existsSync(pkgPath)) {
-    console.error("FATAL: template/package.json missing!");
-    process.exit(1);
-  }
-  console.log("✓ Done. App:", payload.app_name);
+  console.log(`✓ Done. App: "${appName}" (${pkgId}) v${versionName}`);
 })().catch((e) => {
   console.error("inject-files failed:", e);
   process.exit(1);
