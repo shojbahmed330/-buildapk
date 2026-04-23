@@ -1,8 +1,4 @@
-// Build-time injector:
-// 1. Copies the production template/ folder to a fresh build dir
-// 2. Overlays AI-generated files from the Supabase build-files endpoint
-// 3. Skips AI-generated copies of protected config files
-
+// Build-time injector with template + AI overlay
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
@@ -15,8 +11,9 @@ if (!FILES_URL || !SECRET) {
   process.exit(1);
 }
 
-const REPO_TEMPLATE = path.join(process.cwd(), "template");
-const BUILD_DIR = path.join(process.cwd(), "build-template");
+const ROOT = process.cwd();
+const REPO_TEMPLATE = path.join(ROOT, "template");
+const BUILD_DIR = path.join(ROOT, "build-template");
 
 const PROTECTED_FILES = new Set([
   "index.html", "package.json", "package-lock.json",
@@ -58,10 +55,11 @@ function writeFile(root, rel, content) {
 
 (async () => {
   if (!fs.existsSync(path.join(REPO_TEMPLATE, "package.json"))) {
-    console.error("FATAL: ./template/package.json missing in repo. Commit the template/ folder.");
+    console.error("FATAL: ./template/package.json missing in repo.");
     process.exit(1);
   }
 
+  // Build into a temp dir, then swap into ./template/
   if (fs.existsSync(BUILD_DIR)) fs.rmSync(BUILD_DIR, { recursive: true, force: true });
   copyDir(REPO_TEMPLATE, BUILD_DIR);
   console.log("✓ Copied repo template/ -> build-template/");
@@ -88,7 +86,9 @@ function writeFile(root, rel, content) {
   const appName = payload.app_name || "My App";
   const pkgId = payload.package_id || "app.lovable.generated";
   const versionName = payload.version_name || "1.0.0";
+  const versionCode = payload.version_code || 1;
 
+  // Patch capacitor.config.ts in build dir
   const capPath = path.join(BUILD_DIR, "capacitor.config.ts");
   if (fs.existsSync(capPath)) {
     let cap = fs.readFileSync(capPath, "utf8");
@@ -97,6 +97,7 @@ function writeFile(root, rel, content) {
     fs.writeFileSync(capPath, cap);
   }
 
+  // Patch index.html title
   const htmlPath = path.join(BUILD_DIR, "index.html");
   if (fs.existsSync(htmlPath)) {
     let html = fs.readFileSync(htmlPath, "utf8");
@@ -104,6 +105,7 @@ function writeFile(root, rel, content) {
     fs.writeFileSync(htmlPath, html);
   }
 
+  // Patch package.json version
   const pkgPath = path.join(BUILD_DIR, "package.json");
   if (fs.existsSync(pkgPath)) {
     const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
@@ -111,21 +113,24 @@ function writeFile(root, rel, content) {
     fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
   }
 
-  const TEMP_BACKUP = path.join(process.cwd(), ".template-original");
+  // Swap build-template -> template (replace original)
+  const TEMP_BACKUP = path.join(ROOT, ".template-original");
   if (fs.existsSync(TEMP_BACKUP)) fs.rmSync(TEMP_BACKUP, { recursive: true, force: true });
   fs.renameSync(REPO_TEMPLATE, TEMP_BACKUP);
   fs.renameSync(BUILD_DIR, REPO_TEMPLATE);
   console.log("✓ Activated build-template at ./template/");
 
-  fs.writeFileSync(
-    path.join(process.cwd(), ".build-meta.json"),
-    JSON.stringify({
-      app_name: appName, package_id: pkgId,
-      version_name: versionName, version_code: payload.version_code,
-    }, null, 2),
-  );
+  // CRITICAL: Write .build-meta.json to repo ROOT (patch-android.js reads from cwd)
+  const meta = JSON.stringify({
+    app_name: appName,
+    package_id: pkgId,
+    version_name: versionName,
+    version_code: versionCode,
+  }, null, 2);
 
-  console.log(`✓ Done. App: "${appName}" (${pkgId}) v${versionName}`);
+  fs.writeFileSync(path.join(ROOT, ".build-meta.json"), meta);
+  console.log(`✓ Wrote .build-meta.json to repo root`);
+  console.log(`✓ Done. App: "${appName}" (${pkgId}) v${versionName} [code ${versionCode}]`);
 })().catch((e) => {
   console.error("inject-files failed:", e);
   process.exit(1);
