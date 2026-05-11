@@ -258,32 +258,56 @@ jobs:
         run: |
           set -e
           /tmp/build_notify.sh step_start gradle "Compiling APK with Gradle"
-          ./gradlew assembleRelease
           if [ "${{ inputs.signing_mode }}" = "release" ]; then
-            # AAB step is allowed to fail — we'll still ship the signed APK so
-            # the user isn't left with nothing. Failure is recorded as a warning.
+            ./gradlew assembleRelease
+            APK_PATH=$(ls app/build/outputs/apk/release/*.apk | grep -v unsigned | head -1)
             if ./gradlew bundleRelease; then
               echo "aab_ok=1" >> $GITHUB_ENV
             else
               echo "::warning ::bundleRelease failed — Play Store AAB unavailable, falling back to signed APK only."
               echo "aab_ok=0" >> $GITHUB_ENV
             fi
+          else
+            # Debug build = signed with Android's debug keystore → installable.
+            # assembleRelease without a signing config produces an unsigned APK
+            # which Android rejects ("App not installed, package appears invalid").
+            ./gradlew assembleDebug
+            APK_PATH=$(ls app/build/outputs/apk/debug/*.apk | head -1)
           fi
+          echo "apk_path=$APK_PATH" >> $GITHUB_ENV
+          echo "Built APK: $APK_PATH ($(stat -c%s "$APK_PATH") bytes)"
           /tmp/build_notify.sh step_done gradle "APK compiled"
 
       - name: Notify — uploading APK
-        run: /tmp/build_notify.sh step_start upload "Uploading APK artifact"
+        run: /tmp/build_notify.sh step_start upload "Uploading APK"
 
-      - name: Upload APK
+      - name: Upload APK to storage (direct download)
+        id: storage
+        working-directory: workspace/android
+        run: |
+          set -e
+          UPLOAD_URL="${{ inputs.callback_url }}"
+          UPLOAD_URL="${UPLOAD_URL%/build-webhook}/build-upload-apk?build_id=${{ inputs.build_id }}&kind=apk&filename=$(basename "$apk_path")"
+          RESP=$(curl -fsS -X POST "$UPLOAD_URL" \
+            -H "x-build-secret: ${{ inputs.webhook_secret }}" \
+            -H "Content-Type: application/vnd.android.package-archive" \
+            --data-binary "@$apk_path")
+          echo "$RESP"
+          STORAGE_URL=$(node -e "console.log(JSON.parse(process.argv[1]).url||'')" "$RESP")
+          APK_SIZE=$(stat -c%s "$apk_path")
+          echo "download_url=$STORAGE_URL" >> $GITHUB_OUTPUT
+          echo "apk_size=$APK_SIZE" >> $GITHUB_OUTPUT
+
+      - name: Upload APK artifact (backup)
         id: apk
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-apk
-          path: workspace/android/app/build/outputs/apk/release/*.apk
+          name: app-apk
+          path: ${{ env.apk_path }}
           retention-days: 30
 
       - name: Notify — uploaded APK
-        run: /tmp/build_notify.sh step_done upload "APK artifact uploaded"
+        run: /tmp/build_notify.sh step_done upload "APK uploaded"
 
       - name: Upload AAB
         if: ${{ inputs.signing_mode == 'release' && env.aab_ok == '1' }}
@@ -299,7 +323,7 @@ jobs:
         run: |
           curl -sS -X POST "${{ inputs.callback_url }}" \
             -H "x-build-secret: ${{ inputs.webhook_secret }}" -H "Content-Type: application/json" \
-            -d "{\"build_id\":\"${{ inputs.build_id }}\",\"event\":\"build_done\",\"download_url\":\"${{ steps.apk.outputs.artifact-url }}\",\"aab_download_url\":\"${{ steps.aab.outputs.artifact-url }}\",\"keystore_sha1\":\"${{ steps.keystore.outputs.sha1 }}\"}"
+            -d "{\"build_id\":\"${{ inputs.build_id }}\",\"event\":\"build_done\",\"download_url\":\"${{ steps.storage.outputs.download_url }}\",\"file_size_bytes\":${{ steps.storage.outputs.apk_size }},\"aab_download_url\":\"${{ steps.aab.outputs.artifact-url }}\",\"keystore_sha1\":\"${{ steps.keystore.outputs.sha1 }}\"}"
 
       - name: Notify — failed
         if: failure()
