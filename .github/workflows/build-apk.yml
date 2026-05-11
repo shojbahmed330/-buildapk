@@ -78,6 +78,11 @@ jobs:
         run: |
           set -e
           /tmp/build_notify.sh step_start cap_sync "Syncing Android project"
+          # Capacitor needs TypeScript to parse capacitor.config.ts
+          if [ ! -d node_modules/typescript ]; then
+            node -e "const fs=require('fs');const p='package.json';const pkg=JSON.parse(fs.readFileSync(p,'utf8'));pkg.devDependencies={...(pkg.devDependencies||{}),typescript:pkg.devDependencies?.typescript||'^5.8.3'};fs.writeFileSync(p,JSON.stringify(pkg,null,2)+'\n');"
+            npm install --no-audit --no-fund --include=dev
+          fi
           if [ ! -f android/gradlew ]; then
             rm -rf android
             npx cap add android
