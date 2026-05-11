@@ -1,148 +1,304 @@
 name: Build APK
 
+# Inputs:
+#   build_id, app_name, package_id, version_name, version_code,
+#   signing_mode (debug|release),
+#   callback_url (build-webhook), files_url, keystore_url, webhook_secret
+
 on:
   workflow_dispatch:
     inputs:
-      build_id:        { required: true, type: string }
-      app_name:        { required: true, type: string }
-      package_id:      { required: true, type: string }
-      version_name:    { required: true, type: string }
-      version_code:    { required: true, type: string }
-      callback_url:    { required: true, type: string }
-      files_url:       { required: true, type: string }
-      webhook_secret:  { required: true, type: string }
+      build_id:        { required: true }
+      app_name:        { required: false }
+      package_id:      { required: false }
+      version_name:    { required: false }
+      version_code:    { required: false }
+      signing_mode:    { required: false, default: "debug" }
+      callback_url:    { required: true }
+      files_url:       { required: true }
+      keystore_url:    { required: false }
+      webhook_secret:  { required: true }
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    env:
-      BUILD_ID:       ${{ inputs.build_id }}
-      APP_NAME:       ${{ inputs.app_name }}
-      PACKAGE_ID:     ${{ inputs.package_id }}
-      VERSION_NAME:   ${{ inputs.version_name }}
-      VERSION_CODE:   ${{ inputs.version_code }}
-      CALLBACK_URL:   ${{ inputs.callback_url }}
-      FILES_URL:      ${{ inputs.files_url }}
-      WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
-      RUN_URL:        ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
+    timeout-minutes: 35
     steps:
-      - name: Checkout template
-        uses: actions/checkout@v4
-
-      - name: Make scripts executable
-        run: chmod +x scripts/*.sh
-
-      - name: Mark queued done
-        run: ./scripts/notify.sh step_done queued "Runner started"
-        shell: bash
-
-      - name: Notify checkout
-        run: ./scripts/notify.sh step_done checkout
-
-      - name: Setup Node 20
+      - name: Setup Node
         uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+        with: { node-version: "20" }
 
-      - name: Setup Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
+        with: { distribution: "temurin", java-version: "17" }
 
-      - name: Inject project files
-        run: |
-          ./scripts/notify.sh step_start inject "Downloading project snapshot"
-          node scripts/inject-files.js
-          ./scripts/notify.sh step_done inject
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Install dependencies
-        working-directory: template
+      - name: Prepare progress reporter
         run: |
-          ../scripts/notify.sh step_start install
-          npm install
-          ../scripts/notify.sh step_done install
+          cat >/tmp/build_notify.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          EVENT="$1"; STEP="${2:-}"; DETAIL="${3:-}"
+          PAYLOAD=$(node -e 'const [build_id,event,step_key,detail]=process.argv.slice(1); const body={build_id,event}; if(step_key) body.step_key=step_key; if(detail) body.detail=detail; if(event==="step_start"){body.github_run_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"; body.github_run_id="${{ github.run_id }}"} console.log(JSON.stringify(body));' "${{ inputs.build_id }}" "$EVENT" "$STEP" "$DETAIL")
+          curl -sS -X POST "${{ inputs.callback_url }}" -H "x-build-secret: ${{ inputs.webhook_secret }}" -H "Content-Type: application/json" -d "$PAYLOAD"
+          SH
+          chmod +x /tmp/build_notify.sh
+          /tmp/build_notify.sh step_done queued "GitHub workflow started"
 
-      - name: Build web bundle
-        working-directory: template
+      - name: Fetch project files
         run: |
-          ../scripts/notify.sh step_start web_build
+          /tmp/build_notify.sh step_start checkout "Fetching project files"
+          mkdir -p workspace && cd workspace
+          curl -fsS "${{ inputs.files_url }}" \
+            -H "x-build-secret: ${{ inputs.webhook_secret }}" -o files.json
+          node -e "const fs=require('fs'),p=require('path');const j=JSON.parse(fs.readFileSync('files.json','utf8'));for(const f of j.files){fs.mkdirSync(p.dirname(f.path),{recursive:true});fs.writeFileSync(f.path,f.content)}"
+          /tmp/build_notify.sh step_done checkout "Project files loaded"
+
+      - name: Install deps
+        working-directory: workspace
+        run: |
+          /tmp/build_notify.sh step_start install "Installing npm dependencies"
+          npm install --no-audit --no-fund
+          /tmp/build_notify.sh step_done install "Dependencies installed"
+
+      - name: Vite build
+        working-directory: workspace
+        run: |
+          /tmp/build_notify.sh step_start web_build "Building Vite bundle"
           npm run build
-          ../scripts/notify.sh step_done web_build
+          /tmp/build_notify.sh step_done web_build "Web bundle built"
 
-      - name: Capacitor add android + sync
-        working-directory: template
+      - name: Capacitor sync
+        working-directory: workspace
         run: |
-          ../scripts/notify.sh step_start cap_sync
+          /tmp/build_notify.sh step_start cap_sync "Syncing Android project"
           npx cap add android || true
           npx cap sync android
-          node ../scripts/patch-android.js
-          ../scripts/notify.sh step_done cap_sync
+          /tmp/build_notify.sh step_done cap_sync "Android project synced"
 
-      - name: Gradle assembleDebug
-        working-directory: template/android
+      # ── Custom branding (logo + name + package id + version) ────────
+      # files.json carries logo_url / splash_url / colors. We rewrite
+      # applicationId, versionCode, versionName in app/build.gradle and
+      # regenerate every mipmap density from the user-supplied 512×512 PNG.
+      - name: Apply custom branding
+        working-directory: workspace
         run: |
-          ../../scripts/notify.sh step_start gradle
-          chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon
-          ../../scripts/notify.sh step_done gradle
+          set -e
+          /tmp/build_notify.sh step_start inject "Applying app branding"
+          sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick >/dev/null
+          node -e "
+            const fs=require('fs');const j=JSON.parse(fs.readFileSync('files.json','utf8'));
+            const out={
+              app_name:j.app_name||'My App',
+              package_id:j.package_id||'app.lovable.unknown',
+              version_name:j.version_name||'1.0.0',
+              version_code:String(j.version_code||1),
+              logo_url:j.logo_url||'',
+              splash_url:j.splash_url||'',
+              adaptive_bg:j.adaptive_bg_color||'#FFFFFF',
+              splash_bg:j.splash_bg_color||'#FFFFFF',
+            };
+            for(const [k,v] of Object.entries(out)) console.log('::add-mask::'+v.length); // noop — keeps node happy
+            fs.writeFileSync('branding.env',Object.entries(out).map(([k,v])=>k+'='+v).join('\n'));
+          "
+          set -a; . ./branding.env; set +a
+          GRADLE=android/app/build.gradle
+          if [ -f "$GRADLE" ]; then
+            # applicationId
+            sed -i -E "s|applicationId\s+\"[^\"]+\"|applicationId \"${package_id}\"|g" "$GRADLE"
+            sed -i -E "s|applicationId\s+'[^']+'|applicationId \"${package_id}\"|g" "$GRADLE"
+            # versionCode
+            sed -i -E "s|versionCode\s+[0-9]+|versionCode ${version_code}|g" "$GRADLE"
+            # versionName
+            sed -i -E "s|versionName\s+\"[^\"]+\"|versionName \"${version_name}\"|g" "$GRADLE"
+          fi
 
-      - name: Locate APK
-        id: apk
-        run: |
-          APK=$(find template/android/app/build/outputs/apk -name "*.apk" | head -n1)
-          echo "APK path: $APK"
-          if [ -z "$APK" ]; then echo "No APK produced"; exit 1; fi
-          SIZE=$(stat -c%s "$APK")
-          SAFE_APP_NAME=$(echo "$APP_NAME" | tr ' /' '--')
-          NEW="$SAFE_APP_NAME-$BUILD_ID.apk"
-          cp "$APK" "$NEW"
-          echo "apk_path=$NEW" >> "$GITHUB_OUTPUT"
-          echo "apk_size=$SIZE" >> "$GITHUB_OUTPUT"
+          # AndroidManifest package attribute (legacy) — best effort
+          MAN=android/app/src/main/AndroidManifest.xml
+          if [ -f "$MAN" ]; then
+            sed -i -E "s|package=\"[^\"]+\"|package=\"${package_id}\"|" "$MAN" || true
+          fi
 
-      - name: Upload to GitHub Release
-        id: release
+          # strings.xml app_name
+          STR=android/app/src/main/res/values/strings.xml
+          if [ -f "$STR" ]; then
+            sed -i -E "s|(<string name=\"app_name\">)[^<]*(</string>)|\1${app_name}\2|" "$STR" || true
+            sed -i -E "s|(<string name=\"title_activity_main\">)[^<]*(</string>)|\1${app_name}\2|" "$STR" || true
+          fi
+
+          # Logo → mipmap-* icons
+          if [ -n "${logo_url}" ]; then
+            curl -fsSL "${logo_url}" -o /tmp/logo.png
+            RES=android/app/src/main/res
+            declare -A SIZES=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
+            for d in "${!SIZES[@]}"; do
+              S=${SIZES[$d]}
+              mkdir -p "$RES/mipmap-$d"
+              convert /tmp/logo.png -resize ${S}x${S} "$RES/mipmap-$d/ic_launcher.png"
+              # Round icon — same square (Android masks it at runtime)
+              cp "$RES/mipmap-$d/ic_launcher.png" "$RES/mipmap-$d/ic_launcher_round.png"
+              # Adaptive foreground (108dp -> use 432 base, scale per density)
+              FG=$((S * 9 / 4))
+              convert /tmp/logo.png -resize ${FG}x${FG} -background none -gravity center -extent ${FG}x${FG} "$RES/mipmap-$d/ic_launcher_foreground.png"
+            done
+
+            # Adaptive icon XML + background color
+            mkdir -p "$RES/mipmap-anydpi-v26" "$RES/values"
+            cat > "$RES/mipmap-anydpi-v26/ic_launcher.xml" <<XML
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@color/ic_launcher_background"/>
+            <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+            cp "$RES/mipmap-anydpi-v26/ic_launcher.xml" "$RES/mipmap-anydpi-v26/ic_launcher_round.xml"
+
+            # ic_launcher_background color
+            COLORS="$RES/values/ic_launcher_background.xml"
+            cat > "$COLORS" <<XML
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+            <color name="ic_launcher_background">${adaptive_bg}</color>
+          </resources>
+          XML
+          fi
+
+          # Splash screen (Capacitor SplashScreen plugin reads drawable/splash.png)
+          if [ -n "${splash_url}" ]; then
+            curl -fsSL "${splash_url}" -o /tmp/splash.png
+            RES=android/app/src/main/res
+            for d in drawable drawable-port-hdpi drawable-port-xhdpi drawable-port-xxhdpi drawable-port-xxxhdpi drawable-land-hdpi drawable-land-xhdpi drawable-land-xxhdpi drawable-land-xxxhdpi; do
+              mkdir -p "$RES/$d"
+              convert /tmp/splash.png "$RES/$d/splash.png"
+            done
+          fi
+          /tmp/build_notify.sh step_done inject "Branding applied"
+        shell: bash
+
+
+      # ── Release signing path ────────────────────────────────────────
+      - name: Fetch / generate keystore
+        if: ${{ inputs.signing_mode == 'release' }}
+        id: keystore
         run: |
-          ./scripts/notify.sh step_start upload
-          TAG="build-$BUILD_ID"
-          gh release delete "$TAG" -y || true
-          git tag -d "$TAG" || true
-          git push --delete origin "$TAG" || true
-          gh release create "$TAG" "${{ steps.apk.outputs.apk_path }}" \
-            --title "$APP_NAME ($BUILD_ID)" \
-            --notes "Automated APK build for $APP_NAME ($PACKAGE_ID v$VERSION_NAME)"
-          URL=$(gh release view "$TAG" --json assets -q ".assets[0].url")
-          echo "download_url=$URL" >> "$GITHUB_OUTPUT"
-          ./scripts/notify.sh step_done upload "$URL"
+          set -e
+          curl -fsS "${{ inputs.keystore_url }}&action=fetch" \
+            -H "x-build-secret: ${{ inputs.webhook_secret }}" -o ks.json
+          node -e "
+            const fs=require('fs');const j=JSON.parse(fs.readFileSync('ks.json','utf8'));
+            if(!j.has_keystore){console.error('no keystore configured');process.exit(2)}
+            fs.writeFileSync('ks.alias',j.alias);
+            fs.writeFileSync('ks.spw',j.store_password);
+            fs.writeFileSync('ks.kpw',j.key_password);
+            fs.writeFileSync('ks.dname',j.dname);
+            fs.writeFileSync('ks.validity',String(j.validity_days));
+            fs.writeFileSync('ks.needs_gen',j.needs_generation?'1':'0');
+            if(j.jks_base64){fs.writeFileSync('app.jks',Buffer.from(j.jks_base64,'base64'))}
+          "
+          ALIAS=$(cat ks.alias); SPW=$(cat ks.spw); KPW=$(cat ks.kpw); DNAME=$(cat ks.dname); VAL=$(cat ks.validity); NEEDS=$(cat ks.needs_gen)
+          if [ "$NEEDS" = "1" ]; then
+            keytool -genkeypair -v -keystore app.jks -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity "$VAL" \
+              -storepass "$SPW" -keypass "$KPW" -dname "$DNAME"
+            B64=$(base64 -w0 app.jks)
+            SHA1=$(keytool -list -v -keystore app.jks -alias "$ALIAS" -storepass "$SPW" | grep "SHA1:" | head -1 | awk '{print $2}')
+            SHA256=$(keytool -list -v -keystore app.jks -alias "$ALIAS" -storepass "$SPW" | grep "SHA256:" | head -1 | awk '{print $2}')
+            curl -fsS -X POST "${{ inputs.keystore_url }}&action=upload" \
+              -H "x-build-secret: ${{ inputs.webhook_secret }}" -H "Content-Type: application/json" \
+              -d "{\"jks_base64\":\"$B64\",\"sha1\":\"$SHA1\",\"sha256\":\"$SHA256\"}"
+            echo "sha1=$SHA1" >> $GITHUB_OUTPUT
+          else
+            SHA1=$(keytool -list -v -keystore app.jks -alias "$ALIAS" -storepass "$SPW" | grep "SHA1:" | head -1 | awk '{print $2}')
+            echo "sha1=$SHA1" >> $GITHUB_OUTPUT
+          fi
+          mv app.jks workspace/android/app/release.jks
+          echo "alias=$ALIAS" >> $GITHUB_OUTPUT
+          echo "::add-mask::$SPW"
+          echo "::add-mask::$KPW"
+          echo "spw=$SPW" >> $GITHUB_OUTPUT
+          echo "kpw=$KPW" >> $GITHUB_OUTPUT
+
+      - name: Patch Gradle for signing
+        if: ${{ inputs.signing_mode == 'release' }}
+        working-directory: workspace/android
+        run: |
+          cat >> app/build.gradle <<EOF
+
+          android {
+            signingConfigs {
+              release {
+                storeFile file('release.jks')
+                storePassword System.getenv('KS_STORE_PW')
+                keyAlias System.getenv('KS_ALIAS')
+                keyPassword System.getenv('KS_KEY_PW')
+              }
+            }
+            buildTypes {
+              release { signingConfig signingConfigs.release }
+            }
+          }
+          EOF
+
+      - name: Build APK + AAB
+        working-directory: workspace/android
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Notify build done
+          KS_STORE_PW: ${{ steps.keystore.outputs.spw }}
+          KS_KEY_PW: ${{ steps.keystore.outputs.kpw }}
+          KS_ALIAS: ${{ steps.keystore.outputs.alias }}
         run: |
-          curl -fsS -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            -H "x-build-secret: $WEBHOOK_SECRET" \
-            -d "$(jq -nc \
-              --arg id "$BUILD_ID" \
-              --arg url "${{ steps.release.outputs.download_url }}" \
-              --arg run_id "${{ github.run_id }}" \
-              --arg run_url "$RUN_URL" \
-              --argjson size ${{ steps.apk.outputs.apk_size }} \
-              --arg secret "$WEBHOOK_SECRET" \
-              '{event:"build_done", build_id:$id, download_url:$url, file_size_bytes:$size, github_run_id:$run_id, github_run_url:$run_url, secret:$secret}')"
+          set -e
+          /tmp/build_notify.sh step_start gradle "Compiling APK with Gradle"
+          ./gradlew assembleRelease
+          if [ "${{ inputs.signing_mode }}" = "release" ]; then
+            # AAB step is allowed to fail — we'll still ship the signed APK so
+            # the user isn't left with nothing. Failure is recorded as a warning.
+            if ./gradlew bundleRelease; then
+              echo "aab_ok=1" >> $GITHUB_ENV
+            else
+              echo "::warning ::bundleRelease failed — Play Store AAB unavailable, falling back to signed APK only."
+              echo "aab_ok=0" >> $GITHUB_ENV
+            fi
+          fi
+          /tmp/build_notify.sh step_done gradle "APK compiled"
 
-      - name: Notify failure
+      - name: Notify — uploading APK
+        run: /tmp/build_notify.sh step_start upload "Uploading APK artifact"
+
+      - name: Upload APK
+        id: apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: workspace/android/app/build/outputs/apk/release/*.apk
+          retention-days: 30
+
+      - name: Notify — uploaded APK
+        run: /tmp/build_notify.sh step_done upload "APK artifact uploaded"
+
+      - name: Upload AAB
+        if: ${{ inputs.signing_mode == 'release' && env.aab_ok == '1' }}
+        id: aab
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: workspace/android/app/build/outputs/bundle/release/*.aab
+          retention-days: 30
+
+      - name: Notify — ready
+        if: success()
+        run: |
+          curl -sS -X POST "${{ inputs.callback_url }}" \
+            -H "x-build-secret: ${{ inputs.webhook_secret }}" -H "Content-Type: application/json" \
+            -d "{\"build_id\":\"${{ inputs.build_id }}\",\"event\":\"build_done\",\"download_url\":\"${{ steps.apk.outputs.artifact-url }}\",\"aab_download_url\":\"${{ steps.aab.outputs.artifact-url }}\",\"keystore_sha1\":\"${{ steps.keystore.outputs.sha1 }}\"}"
+
+      - name: Notify — failed
         if: failure()
         run: |
-          curl -fsS -X POST "$CALLBACK_URL" \
-            -H "Content-Type: application/json" \
-            -H "x-build-secret: $WEBHOOK_SECRET" \
-            -d "$(jq -nc \
-              --arg id "$BUILD_ID" \
-              --arg msg "Build failed. See GitHub run logs." \
-              --arg run_id "${{ github.run_id }}" \
-              --arg run_url "$RUN_URL" \
-              --arg secret "$WEBHOOK_SECRET" \
-              '{event:"build_failed", build_id:$id, error_message:$msg, github_run_id:$run_id, github_run_url:$run_url, secret:$secret}')" || true
+          curl -sS -X POST "${{ inputs.callback_url }}" \
+            -H "x-build-secret: ${{ inputs.webhook_secret }}" -H "Content-Type: application/json" \
+            -d '{"build_id":"${{ inputs.build_id }}","event":"build_failed","error_message":"Build failed — see Actions log"}'
