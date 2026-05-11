@@ -16,7 +16,7 @@
     "framer-motion": "^11.11.17",
     "clsx": "^2.1.1",
     "tailwind-merge": "^2.5.5",
-    "class-variance-authority": "^0.7.1"
+    "class-variance-authority": "^0.7.1",
     "sonner": "^1.7.4"
   },
   "devDependencies": {
