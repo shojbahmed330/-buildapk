@@ -76,9 +76,14 @@ jobs:
       - name: Capacitor sync
         working-directory: workspace
         run: |
+          set -e
           /tmp/build_notify.sh step_start cap_sync "Syncing Android project"
-          npx cap add android || true
+          if [ ! -f android/gradlew ]; then
+            rm -rf android
+            npx cap add android
+          fi
           npx cap sync android
+          test -f android/gradlew
           /tmp/build_notify.sh step_done cap_sync "Android project synced"
 
       # ── Custom branding (logo + name + package id + version) ────────
