@@ -3,6 +3,7 @@ name: Build APK
 # Inputs:
 #   build_id, app_name, package_id, version_name, version_code,
 #   signing_mode (debug|release),
+#   build_target  (apk-debug | apk-release | aab-release)  ← NEW
 #   callback_url (build-webhook), files_url, keystore_url, webhook_secret
 
 on:
@@ -14,6 +15,7 @@ on:
       version_name:    { required: false }
       version_code:    { required: false }
       signing_mode:    { required: false, default: "debug" }
+      build_target:    { required: false, default: "" }
       callback_url:    { required: true }
       files_url:       { required: true }
       keystore_url:    { required: false }
@@ -254,39 +256,84 @@ jobs:
           }
           EOF
 
-      - name: Build APK + AAB
+      # ── Resolve effective build target (legacy fallback) ────────────
+      # Old callers don't pass build_target; preserve current behaviour:
+      #   signing_mode=release  → apk-release (signed APK + best-effort AAB)
+      #   signing_mode=debug    → apk-debug
+      # New callers pass one of: apk-debug | apk-release | aab-release
+      - name: Resolve build target
+        id: target
+        run: |
+          BT="${{ inputs.build_target }}"
+          if [ -z "$BT" ]; then
+            if [ "${{ inputs.signing_mode }}" = "release" ]; then BT="apk-release"; else BT="apk-debug"; fi
+            LEGACY=1
+          else
+            LEGACY=0
+          fi
+          echo "build_target=$BT"  >> $GITHUB_OUTPUT
+          echo "legacy=$LEGACY"    >> $GITHUB_OUTPUT
+          case "$BT" in
+            apk-debug)   echo "want_apk=1" >> $GITHUB_OUTPUT; echo "want_aab=0" >> $GITHUB_OUTPUT ;;
+            apk-release) echo "want_apk=1" >> $GITHUB_OUTPUT; echo "want_aab=0" >> $GITHUB_OUTPUT ;;
+            aab-release) echo "want_apk=0" >> $GITHUB_OUTPUT; echo "want_aab=1" >> $GITHUB_OUTPUT ;;
+            *) echo "::error ::Unknown build_target $BT"; exit 1 ;;
+          esac
+          # Legacy release path also produced an AAB best-effort.
+          if [ "$LEGACY" = "1" ] && [ "${{ inputs.signing_mode }}" = "release" ]; then
+            echo "want_aab=1" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build with Gradle
         working-directory: workspace/android
         env:
           KS_STORE_PW: ${{ steps.keystore.outputs.spw }}
           KS_KEY_PW: ${{ steps.keystore.outputs.kpw }}
           KS_ALIAS: ${{ steps.keystore.outputs.alias }}
+          WANT_APK: ${{ steps.target.outputs.want_apk }}
+          WANT_AAB: ${{ steps.target.outputs.want_aab }}
+          BT: ${{ steps.target.outputs.build_target }}
         run: |
           set -e
-          /tmp/build_notify.sh step_start gradle "Compiling APK with Gradle"
-          if [ "${{ inputs.signing_mode }}" = "release" ]; then
-            ./gradlew assembleRelease
-            APK_PATH=$(ls app/build/outputs/apk/release/*.apk | grep -v unsigned | head -1)
-            if ./gradlew bundleRelease; then
-              echo "aab_ok=1" >> $GITHUB_ENV
+          /tmp/build_notify.sh step_start gradle "Compiling ($BT)"
+          APK_PATH=""; AAB_PATH=""
+
+          if [ "$WANT_APK" = "1" ]; then
+            if [ "${{ inputs.signing_mode }}" = "release" ]; then
+              ./gradlew assembleRelease
+              APK_PATH=$(ls app/build/outputs/apk/release/*.apk | grep -v unsigned | head -1)
             else
-              echo "::warning ::bundleRelease failed — Play Store AAB unavailable, falling back to signed APK only."
-              echo "aab_ok=0" >> $GITHUB_ENV
+              # Debug build = signed with Android's debug keystore → installable.
+              ./gradlew assembleDebug
+              APK_PATH=$(ls app/build/outputs/apk/debug/*.apk | head -1)
             fi
-          else
-            # Debug build = signed with Android's debug keystore → installable.
-            # assembleRelease without a signing config produces an unsigned APK
-            # which Android rejects ("App not installed, package appears invalid").
-            ./gradlew assembleDebug
-            APK_PATH=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+            echo "apk_path=$APK_PATH" >> $GITHUB_ENV
+            echo "Built APK: $APK_PATH ($(stat -c%s "$APK_PATH") bytes)"
           fi
-          echo "apk_path=$APK_PATH" >> $GITHUB_ENV
-          echo "Built APK: $APK_PATH ($(stat -c%s "$APK_PATH") bytes)"
-          /tmp/build_notify.sh step_done gradle "APK compiled"
 
-      - name: Notify — uploading APK
-        run: /tmp/build_notify.sh step_start upload "Uploading APK"
+          if [ "$WANT_AAB" = "1" ]; then
+            if ./gradlew bundleRelease; then
+              AAB_PATH=$(ls app/build/outputs/bundle/release/*.aab | head -1)
+              echo "aab_path=$AAB_PATH" >> $GITHUB_ENV
+              echo "aab_ok=1" >> $GITHUB_ENV
+              echo "Built AAB: $AAB_PATH ($(stat -c%s "$AAB_PATH") bytes)"
+            else
+              echo "aab_ok=0" >> $GITHUB_ENV
+              if [ "$BT" = "aab-release" ]; then
+                echo "::error ::bundleRelease failed and AAB was the requested artifact."
+                exit 1
+              else
+                echo "::warning ::bundleRelease failed — AAB unavailable, signed APK still produced."
+              fi
+            fi
+          fi
+          /tmp/build_notify.sh step_done gradle "Build complete"
 
-      - name: Upload APK to storage (direct download)
+      - name: Notify — uploading
+        run: /tmp/build_notify.sh step_start upload "Uploading artifact"
+
+      - name: Upload APK to storage
+        if: ${{ env.apk_path != '' }}
         id: storage
         working-directory: workspace/android
         run: |
@@ -301,34 +348,54 @@ jobs:
           STORAGE_URL=$(node -e "console.log(JSON.parse(process.argv[1]).url||'')" "$RESP")
           APK_SIZE=$(stat -c%s "$apk_path")
           echo "download_url=$STORAGE_URL" >> $GITHUB_OUTPUT
-          echo "apk_size=$APK_SIZE" >> $GITHUB_OUTPUT
+          echo "apk_size=$APK_SIZE"        >> $GITHUB_OUTPUT
+
+      - name: Upload AAB to storage
+        if: ${{ env.aab_path != '' }}
+        id: aab_storage
+        working-directory: workspace/android
+        run: |
+          set -e
+          UPLOAD_URL="${{ inputs.callback_url }}"
+          UPLOAD_URL="${UPLOAD_URL%/build-webhook}/build-upload-apk?build_id=${{ inputs.build_id }}&kind=aab&filename=$(basename "$aab_path")"
+          RESP=$(curl -fsS -X POST "$UPLOAD_URL" \
+            -H "x-build-secret: ${{ inputs.webhook_secret }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@$aab_path")
+          echo "$RESP"
+          AAB_URL=$(node -e "console.log(JSON.parse(process.argv[1]).url||'')" "$RESP")
+          AAB_SIZE=$(stat -c%s "$aab_path")
+          echo "download_url=$AAB_URL" >> $GITHUB_OUTPUT
+          echo "aab_size=$AAB_SIZE"    >> $GITHUB_OUTPUT
 
       - name: Upload APK artifact (backup)
-        id: apk
+        if: ${{ env.apk_path != '' }}
         uses: actions/upload-artifact@v4
-        with:
-          name: app-apk
-          path: ${{ env.apk_path }}
-          retention-days: 30
+        with: { name: app-apk, path: "${{ env.apk_path }}", retention-days: 30 }
 
-      - name: Notify — uploaded APK
-        run: /tmp/build_notify.sh step_done upload "APK uploaded"
-
-      - name: Upload AAB
-        if: ${{ inputs.signing_mode == 'release' && env.aab_ok == '1' }}
-        id: aab
+      - name: Upload AAB artifact (backup)
+        if: ${{ env.aab_path != '' }}
         uses: actions/upload-artifact@v4
-        with:
-          name: app-release-aab
-          path: workspace/android/app/build/outputs/bundle/release/*.aab
-          retention-days: 30
+        with: { name: app-release-aab, path: "${{ env.aab_path }}", retention-days: 30 }
+
+      - name: Notify — uploaded
+        run: /tmp/build_notify.sh step_done upload "Artifact uploaded"
 
       - name: Notify — ready
         if: success()
         run: |
+          DL_URL="${{ steps.storage.outputs.download_url }}"
+          DL_SIZE="${{ steps.storage.outputs.apk_size }}"
+          AAB_URL="${{ steps.aab_storage.outputs.download_url }}"
+          # If AAB is the only artifact (aab-release), surface it as the primary download.
+          if [ -z "$DL_URL" ] && [ -n "$AAB_URL" ]; then
+            DL_URL="$AAB_URL"
+            DL_SIZE="${{ steps.aab_storage.outputs.aab_size }}"
+          fi
+          DL_SIZE_NUM=${DL_SIZE:-0}
           curl -sS -X POST "${{ inputs.callback_url }}" \
             -H "x-build-secret: ${{ inputs.webhook_secret }}" -H "Content-Type: application/json" \
-            -d "{\"build_id\":\"${{ inputs.build_id }}\",\"event\":\"build_done\",\"download_url\":\"${{ steps.storage.outputs.download_url }}\",\"file_size_bytes\":${{ steps.storage.outputs.apk_size }},\"aab_download_url\":\"${{ steps.aab.outputs.artifact-url }}\",\"keystore_sha1\":\"${{ steps.keystore.outputs.sha1 }}\"}"
+            -d "{\"build_id\":\"${{ inputs.build_id }}\",\"event\":\"build_done\",\"download_url\":\"$DL_URL\",\"file_size_bytes\":$DL_SIZE_NUM,\"aab_download_url\":\"$AAB_URL\",\"keystore_sha1\":\"${{ steps.keystore.outputs.sha1 }}\"}"
 
       - name: Notify — failed
         if: failure()
